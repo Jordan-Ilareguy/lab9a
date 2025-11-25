@@ -7,5 +7,4 @@ idf_component_register(
         esp_netif
         nvs_flash
         mqtt
-        esp_adc
 )

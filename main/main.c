@@ -1,380 +1,271 @@
 #include <stdio.h>
-#include <string.h>
+#include <inttypes.h>
+#include <string.h>                                  
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/event_groups.h"
-#include "esp_wifi.h"
-#include "esp_event.h"
+#include "freertos/event_groups.h"      // Used for Wi-Fi connection flag
+#include "driver/gpio.h"
+#include "driver/i2c.h"
 #include "esp_log.h"
-#include "nvs_flash.h"
-#include "esp_netif.h"
-#include "mqtt_client.h"
-#include "esp_adc/adc_oneshot.h"
+#include "esp_wifi.h"                               // Wi-Fi functions
+#include "esp_event.h"                              // Wi-Fi/MQTT events
+#include "esp_netif.h"                              // Network interface
+#include "nvs_flash.h"                              // Required for Wi-Fi
+#include "mqtt_client.h"                            // MQTT functions
 
-// -------------------------
-// Configuration
-// -------------------------
-#define WIFI_SSID        "Super Cooper" // set to Electronics
-#define WIFI_PASS        "Fr3nch1eBu!!dog" // set to Electr0nic$2024
+// ---------------- I2C Definitions ----------------
+#define I2C_MASTER_SCL_IO           37         // SCL pin
+#define I2C_MASTER_SDA_IO           38         // SDA pin
+#define I2C_MASTER_NUM              I2C_NUM_0
+#define I2C_MASTER_FREQ_HZ          400000     // 400 kHz
+#define I2C_MASTER_TX_BUF_DISABLE   0
+#define I2C_MASTER_RX_BUF_DISABLE   0
 
-// set this to your laptop's IPv4 address to publish your Payload to MQTT Broker.
-#define MQTT_BROKER_URI  "mqtt://192.168.2.48"
+#define MPU_TEMP                    0x41       // Temperature register
+#define MPU6050_ADDR                0x68       // AD0 = GND
+#define MPU6050_WHO_AM_I_REG        0x75
+#define MPU6050_PWR_MGMT_1          0x6B
+#define MPU6050_ACCEL_XOUT_H        0x3B       // Start of accel data
+#define I2C_TIMEOUT_MS              1000
 
-// ADC (ADC1_CH3=GPIO4, ADC1_CH4=GPIO5)
-#define JOY_X_CHANNEL    ADC_CHANNEL_3
-#define JOY_Y_CHANNEL    ADC_CHANNEL_4
-#define JOY_UNIT         ADC_UNIT_1
+// -------- Wi-Fi / MQTT config --------
+#define WIFI_SSID        "Electronics"
+#define WIFI_PASS        "Electr0nic$2024"
+#define MQTT_BROKER_URI  "mqtt://192.168.117.17"
+#define MQTT_TOPIC       "jordan/topic2"
 
-// Event group used to signal Wi-Fi connection status
+static const char *TAG = "MPU6050";
+static const char *TAG_WIFI     = "WiFi"; // Wi-Fi tag
+static const char *TAG_MQTT     = "MQTT"; // MQTT tag
+
+// Function prototype to read bytes (JI)
+esp_err_t i2c_read_bytes(uint8_t device_addr, uint8_t start_reg, uint8_t *buffer, size_t length); // I2C read function
+
+// Event group: signals when Wi-Fi is connected
 static EventGroupHandle_t wifi_event_group;
-static const int WIFI_CONNECTED_BIT = BIT0;
+static const int WIFI_CONNECTED_BIT = BIT0;  // Bit flag = Wi-Fi ready
 
-// Logging tags
-static const char *TAG_WIFI     = "WiFi";
-static const char *TAG_MQTT     = "MQTT";
-static const char *TAG_JOYSTICK = "Joystick";
+// Global MQTT client handle
+static esp_mqtt_client_handle_t g_mqtt = NULL; // MQTT client handle
 
-// Global handles
-static esp_mqtt_client_handle_t global_mqtt_client = NULL;
-static adc_oneshot_unit_handle_t adc_handle;
-
-// -------------------------
-// ADC Initialization
-// -------------------------
-
-/* Function Name - init_adc
- * Description   -
- *     Initializes the ADC one-shot driver and configures the channels
- *     used by the joystick X and Y axes.
- * Parameters    - None
- * Return type   - void
- */
-static void init_adc() {
-    adc_oneshot_unit_init_cfg_t unit_cfg = {
-        .unit_id = JOY_UNIT
-    };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &adc_handle));
-
-    adc_oneshot_chan_cfg_t chan_cfg = {
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-        .atten    = ADC_ATTEN_DB_12
+// ---------------- I2C Master Init ----------------
+esp_err_t i2c_master_init()
+{
+    // Configure I2C master mode, pins, and speed
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
     };
 
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, JOY_X_CHANNEL, &chan_cfg));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, JOY_Y_CHANNEL, &chan_cfg));
-}
+    ESP_ERROR_CHECK(i2c_param_config(I2C_MASTER_NUM, &conf));
 
-// -------------------------
-// Joystick MQTT Publish Task
-// -------------------------
+     // Install I2C driver
+    esp_err_t ret = i2c_driver_install(I2C_MASTER_NUM,
+                              conf.mode,
+                              I2C_MASTER_RX_BUF_DISABLE,
+                              I2C_MASTER_TX_BUF_DISABLE,
+                              0);
 
-/* Function Name - joystick_publish_task
- * Description   -
- *     FreeRTOS task that periodically reads joystick X/Y values and
- *     publishes them as a text message to a specific MQTT topic.
- * Purpose       -
- *     To continuously send live joystick sensor data to the MQTT broker
- *     so that other clients can subscribe and monitor the values.
- * Parameters    - None.
- * Return type   - void
- */
-static void joystick_publish_task() {
-    char message[64];
-
-    while (1) {
-        int x_val = 0, y_val = 0;
-
-        // Read joystick X and Y axis values from ADC
-        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, JOY_X_CHANNEL, &x_val));
-        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, JOY_Y_CHANNEL, &y_val));
-
-        // Format a simple text message with the values
-        snprintf(message, sizeof(message), "Joystick: X=%d, Y=%d", x_val, y_val);
-
-        // Publish only if the MQTT client is valid (connected)
-        if (global_mqtt_client) {
-            esp_mqtt_client_publish(global_mqtt_client,
-                                    "jordan/topic1",
-                                    message,
-                                    0,    // use string length
-                                    0,    // QoS 0 (at most once)
-                                    0);   // no retain flag
-            ESP_LOGI(TAG_JOYSTICK, "Published: %s", message);
-        }
-
-        // Wait 2 seconds before reading and publishing again
-        vTaskDelay(pdMS_TO_TICKS(2000));
-    }
-}
-
-// -------------------------
-// MQTT Handler
-// -------------------------
-
-/* Function Name - mqtt_event_handler_cb
- * Description   -
- *     Callback function that handles MQTT events such as connection,
- *     incoming data, and disconnection.
- * Purpose       -
- *     To react to MQTT client events:
- *       - When connected: subscribe to a topic, start the joystick task,
- *         and send a greeting.
- *       - When data is received: log it and send an acknowledgement.
- *       - When disconnected: log the status.
- *
- * Parameters    -
- *     void *handler_args
- *         User data passed when registering the event handler (unused).
- *
- *     esp_event_base_t base
- *         Event base (should be MQTT_EVENT).
- *
- *     int32_t event_id
- *         Type of MQTT event (e.g., MQTT_EVENT_CONNECTED).
- *
- *     void *event_data
- *         Pointer to esp_mqtt_event_t structure containing event details.
- *
- * Return type   -
- *     void
- */
-static void mqtt_event_handler_cb(void *handler_args,
-                                  esp_event_base_t base,
-                                  int32_t event_id,
-                                  void *event_data) {
-    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
-    static bool greeted = false;
-
-    switch (event_id) {
-        case MQTT_EVENT_CONNECTED:
-            ESP_LOGI(TAG_MQTT, "Connected to MQTT broker.");
-
-            // Subscribe to the topic to receive joystick or text messages
-            esp_mqtt_client_subscribe(event->client, "jordan/topic1", 0);
-
-            // Store client handle globally so the publish task can use it
-            global_mqtt_client = event->client;
-
-            // Start the joystick publishing task after connection
-            xTaskCreate(joystick_publish_task,
-                        "joystick_publish_task",
-                        4096,
-                        NULL,
-                        5,
-                        NULL);
-
-            // Send a greeting message only once
-            if (!greeted) {
-                esp_mqtt_client_publish(event->client,
-                                        "jordan/topic1",
-                                        "Hello from ESP32 jordan!",
-                                        0,
-                                        0,
-                                        0);
-                greeted = true;
-            }
-            break;
-
-        case MQTT_EVENT_DATA: {
-            // Copy incoming data into a local buffer and null-terminate it
-            char rx[256] = {0};
-            int len = (event->data_len < (int)sizeof(rx) - 1)
-                        ? event->data_len
-                        : (int)sizeof(rx) - 1;
-
-            memcpy(rx, event->data, len);
-            rx[len] = '\0';
-
-            // Log topic and payload
-            ESP_LOGI(TAG_MQTT, "Received: topic='%.*s'  data='%s'",
-                     event->topic_len, event->topic, rx);
-
-            // If this is not already an acknowledgement, send one back
-            if (strncmp(rx, "I receive this:", 14) != 0) {
-                char ack[300];
-                snprintf(ack, sizeof(ack), "I receive this: %s", rx);
-                esp_mqtt_client_publish(event->client,
-                                        "jordan/topic1",
-                                        ack,
-                                        0,
-                                        0,
-                                        0);
-            }
-            break;
-        }
-
-        case MQTT_EVENT_DISCONNECTED:
-            ESP_LOGI(TAG_MQTT, "Disconnected from MQTT broker.");
-            break;
-
-        default:
-            // Other MQTT events are ignored in this example
-            break;
-    }
-}
-
-/* Function Name - start_mqtt_client
- *
- * Description   -
- *     Creates and starts the MQTT client using the broker URI defined
- *     in the configuration section.
- *
- * Purpose       -
- *     To initialize the MQTT client, register the event handler, and
- *     start the MQTT connection process.
- *
- * Parameters    - None.
- *
- * Return type   - void
- */
-static void start_mqtt_client() {
-    // Basic MQTT configuration: broker URI only for this example
-    const esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = MQTT_BROKER_URI,
-    };
-
-    // Initialize MQTT client
-    esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
-    if (client == NULL) {
-        ESP_LOGE(TAG_MQTT, "Failed to initialize MQTT client.");
-        return;
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to wake MPU6050: %s", esp_err_to_name(ret)); // Log error
+        return ret;
     }
 
-    // Register event handler and start MQTT client
-    ESP_ERROR_CHECK(esp_mqtt_client_register_event(client,
-                                                   MQTT_EVENT_ANY,
-                                                   mqtt_event_handler_cb,
-                                                   NULL));
-    ESP_ERROR_CHECK(esp_mqtt_client_start(client));
-    ESP_LOGI(TAG_MQTT, "MQTT client started.");
+    // Wake MPU6050 from sleep
+    uint8_t wake[2] = {MPU6050_PWR_MGMT_1, 0x00}; // PWR_MGMT_1 = 0x00 (wake up)
+    ESP_ERROR_CHECK(i2c_master_write_to_device(I2C_MASTER_NUM,
+                                               MPU6050_ADDR,
+                                                wake, 
+                                               sizeof(wake),
+                                               pdMS_TO_TICKS(I2C_TIMEOUT_MS)));
+
+                                               if (ret!= ESP_OK) {
+                                                    ESP_LOGE(TAG, "Failed to wake MPU6050: %s", esp_err_to_name(ret));
+                                                    return ret;
+                                            
 }
 
-// -------------------------
-// Wi-Fi
-// -------------------------
+ESP_LOGI(TAG, "MPU6050 woken up successfully");
+    
+    // Give sensor time to stabilize
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    return ESP_OK;
+}
 
-/* Function Name - wifi_event_handler
- *
- * Description   -
- *     Event handler for Wi-Fi and IP events (station mode).
- *
- * Purpose       -
- *     To:
- *       - Start connection when Wi-Fi station starts.
- *       - Retry connection when disconnected.
- *       - Set an event bit when an IP address is obtained.
- *
- * Parameters    -
- *     void *arg
- *         User data passed at registration (unused).
- *
- *     esp_event_base_t event_base
- *         Event base (WIFI_EVENT or IP_EVENT).
- *
- *     int32_t event_id
- *         Specific event ID within the event base.
- *
- *     void *event_data
- *         Pointer to data for that event (type depends on event).
- *
- * Return type   - void
- */
-static void wifi_event_handler(void *arg,
-                               esp_event_base_t event_base,
-                               int32_t event_id,
-                               void *event_data) {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        // Station started: attempt to connect to the configured AP
-        esp_wifi_connect();
+// ---------------- Wi-Fi Event Handler ----------------
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();  // Try connecting to AP
 
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        // If disconnected, automatically try to reconnect
-        esp_wifi_connect();
-        ESP_LOGI(TAG_WIFI, "Retrying connection to Wi-Fi...");
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect();  // Auto reconnect
+        ESP_LOGI(TAG, "WiFi disconnected, retrying…");
 
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        // When the station gets an IP address, log it and set event bit
-        const ip_event_got_ip_t *event = (const ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG_WIFI, "Got IP address: " IPSTR, IP2STR(&event->ip_info.ip));
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        // IP received → Wi-Fi is now fully connected
+        const ip_event_got_ip_t *e = (const ip_event_got_ip_t *)data;
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&e->ip_info.ip));
+
+        // Set Wi-Fi connected flag
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
-/* Function Name - wifi_init_sta
- * Description   -
- *     Initializes NVS, network interfaces, Wi-Fi in station mode,
- *     registers event handlers, and starts the Wi-Fi connection.
- * Purpose       -
- *     To fully set up the ESP32 as a Wi-Fi station so that it can
- *     connect to the specified access point and obtain an IP address.
- * Parameters    - None.
- * Return type   - void
- */
-static void wifi_init_sta() {
-    // ----- NVS initialization -----
+// ---------------- Wi-Fi Initialization ----------------
+static void wifi_init_sta()
+{
+    // Init NVS (required for Wi-Fi)
     esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
-        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
 
-    // ----- Network interface + event loop -----
+    // Init network stack + default event loop
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
 
-    // ----- Wi-Fi driver initialization -----
+    // Initialize Wi-Fi driver
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    // ----- Register event handlers BEFORE starting Wi-Fi -----
+    // Register event handlers BEFORE Wi-Fi starts
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 
-    // Create event group to track connection status
+    // Create event group for Wi-Fi status
     wifi_event_group = xEventGroupCreate();
 
-    // ----- Configure Wi-Fi station parameters -----
-    wifi_config_t wifi_config = (wifi_config_t){0};
-
-    // Copy SSID and password into config (ensure null-termination)
-    strncpy((char *)wifi_config.sta.ssid,
-            WIFI_SSID,
-            sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char *)wifi_config.sta.password,
-            WIFI_PASS,
-            sizeof(wifi_config.sta.password) - 1);
-
+    // Set Wi-Fi credentials
+    wifi_config_t wifi_config = {0};
+    strncpy((char*)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char*)wifi_config.sta.password, WIFI_PASS, sizeof(wifi_config.sta.password) - 1);
     wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    wifi_config.sta.pmf_cfg.capable = true;
-    wifi_config.sta.pmf_cfg.required = false;
 
-    // ----- Apply Wi-Fi configuration and start station mode -----
+    // Start Wi-Fi in station mode
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG_WIFI, "Wi-Fi init complete. Connecting to SSID: %s", WIFI_SSID);
+    ESP_LOGI(TAG, "Wi-Fi init done. Connecting to %s…", WIFI_SSID);
 }
 
-// -------------------------
-// Main
-// -------------------------
-/* 
- *  1. Initialize and connect to Wi-Fi.
- *  2. Wait until Wi-Fi is connected.
- *  3. Initialize ADC for joystick.
- *  4. Start the MQTT client.
- */
-void app_main() {
-    // Initialize and start Wi-Fi in station mode
-    wifi_init_sta();
+// ---------------- MQTT Event Handler ----------------
+static void mqtt_event_handler(void *handler_args,
+                               esp_event_base_t base,
+                               int32_t event_id,
+                               void *event_data)
+{
+    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
 
-    // Wait indefinitely until we get the "Wi-Fi connected" bit
+    switch (event_id) {
+        case MQTT_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "MQTT connected");
+            g_mqtt = event->client;  // Save MQTT client handle
+            break;
+
+        case MQTT_EVENT_DISCONNECTED:
+            ESP_LOGI(TAG, "MQTT disconnected");
+            g_mqtt = NULL;
+            break;
+
+        default:
+            break;
+    }
+}
+
+// ---------------- Start MQTT Client ----------------
+static void mqtt_start()
+{
+    // Configure MQTT broker URI
+    const esp_mqtt_client_config_t cfg = {
+        .broker.address.uri = MQTT_BROKER_URI,
+    };
+
+    // Create MQTT client
+    esp_mqtt_client_handle_t c = esp_mqtt_client_init(&cfg);
+
+    // Register MQTT event handler
+    ESP_ERROR_CHECK(esp_mqtt_client_register_event(c, MQTT_EVENT_ANY, mqtt_event_handler, NULL));
+
+    // Start MQTT service
+    ESP_ERROR_CHECK(esp_mqtt_client_start(c));
+
+    ESP_LOGI(TAG, "MQTT client started: %s", MQTT_BROKER_URI);
+}
+
+// ---------- Task: Read MPU6050 & Publish JSON ----------  
+static void mpu6050_publish_task(void *arg)
+{
+    while (1) {
+        uint8_t data[14];
+
+        // Read 14 bytes: accel(6), temp(2), gyro(6)
+        if (i2c_read_bytes(MPU6050_ADDR, MPU6050_ACCEL_XOUT_H, data, sizeof(data)) == ESP_OK) {
+
+            // Convert raw sensor values
+            int16_t ax = (data[0] << 8) | data[1];
+            int16_t ay = (data[2] << 8) | data[3];
+            int16_t az = (data[4] << 8) | data[5];
+
+            int16_t temp_raw = (data[6] << 8) | data[7];
+            float temperature = (temp_raw / 340.0f) + 36.53f;
+
+            int16_t gx = (data[8] << 8)  | data[9];
+            int16_t gy = (data[10] << 8) | data[11];
+            int16_t gz = (data[12] << 8) | data[13];
+
+            // Build JSON message
+            char payload[160];
+            snprintf(payload, sizeof(payload),
+                    "{\"ax\":%d,\"ay\":%d,\"az\":%d,\"temp_c\":%.2f,\"gx\":%d,\"gy\":%d,\"gz\":%d}",
+                    ax, ay, az, temperature, gx, gy, gz);
+
+            ESP_LOGI(TAG, "MPU TX: %s", payload);
+
+            // Publish to MQTT topic
+            if (g_mqtt) {
+                esp_mqtt_client_publish(g_mqtt,
+                                    "jordan/topic2",
+                                    payload,
+                                    0,    // use string length
+                                    0,    // QoS 0 (at most once)
+                                    0);   // no retain flag
+            ESP_LOGI(TAG_MQTT, "Published: %s", payload);
+            }
+
+        } else {
+            ESP_LOGW(TAG, "Failed to read MPU6050 data");  // Warning message
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));  // Publish every 1s
+    }
+}
+
+
+void app_main()
+{
+    // Step 1: Initialize I2C
+
+    ESP_ERROR_CHECK(i2c_master_init()); // Initialize I2C
+    ESP_LOGI(TAG, "I2C initialized"); // I2C init done
+
+    // Step 2: Initialize wifi
+
+    wifi_init_sta();
+    ESP_LOGI(TAG_WIFI, "Wi-Fi init started");
+
+// Wait indefinitely until we get the "Wi-Fi connected" bit
     EventBits_t bits = xEventGroupWaitBits(
         wifi_event_group,
         WIFI_CONNECTED_BIT,
@@ -383,13 +274,44 @@ void app_main() {
         portMAX_DELAY);
 
     if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG_WIFI, "Connected to Wi-Fi network: %s", WIFI_SSID);
 
-        // After successful Wi-Fi connection, set up ADC and MQTT
-        init_adc();
-        start_mqtt_client();
-    } else {
-        // This branch should not normally happen with portMAX_DELAY
-        ESP_LOGW(TAG_WIFI, "Failed to connect to Wi-Fi.");
+        ESP_LOGI(TAG_WIFI, "Wi-Fi connected successfully"); // Connected to Wi-Fi
+
+        mqtt_start(); // Start MQTT client
+
+        // Start publisher task
+        xTaskCreate(mpu6050_publish_task, "mpu6050_publish_task", 4096, NULL, 5, NULL);
     }
+
+}
+
+/* ---------- I2C read function definition from Lab 8----------*/
+
+/* Function Name - i2c_read_bytes
+
+* Description - This function reads a block of data from an I2C device.
+
+* Return type - The return type is esp_err_t, which indicates the success or failure of the operation.
+
+* Parameters - 
+
+- parameter1 - uint8_t device_addr: The I2C address of the device to read from.
+
+- parameter2 - uint8_t start_reg: The starting register address to read from.
+
+- parameter3 - uint8_t *buffer: A pointer to the buffer to store the read data.
+
+- parameter4 - size_t length: The number of bytes to read.
+
+*/
+
+esp_err_t i2c_read_bytes(uint8_t device_addr, uint8_t start_reg, uint8_t *buffer, size_t length) // I2C read function definition
+{
+    return i2c_master_write_read_device(I2C_MASTER_NUM,
+                                        device_addr,
+                                        &start_reg,
+                                        1,   
+                                        buffer,
+                                        length,                                                                                                     
+                                        pdMS_TO_TICKS(I2C_TIMEOUT_MS));
 }
